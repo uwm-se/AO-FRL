@@ -146,19 +146,7 @@ Comprehensive documentation available in markdown files:
 
 This project is released for academic research purposes.
 
-## Citation
-
-If you use this code in your research, please cite:
-
-```bibtex
-@misc{aofrl2025,
-  title={Agent-Orchestrated Federated Representation Learning with Privacy-Gated Sharing},
-  author={Your Name},
-  year={2025},
-  howpublished={\url{https://github.com/WillnotchooseC/AO-FRL}}
-}
-```
-
 ## Contact
 
 For questions or issues, please open an issue on GitHub.
+
