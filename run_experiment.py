@@ -29,6 +29,7 @@ from utils import (set_seed, dirichlet_partition, split_train_val,
 from agents.server_agent import ServerAgent, MLPHead
 from agents.evaluator_agent import EvaluatorAgent
 from agents.client_agent import _TransformSubset
+from a2a import A2ABus, AgentCard, Part, Artifact
 
 
 def parse_args():
@@ -47,14 +48,29 @@ def parse_args():
     p.add_argument("--sigma", type=float, default=0.02)
     p.add_argument("--clip_C", type=float, default=1.0)
     p.add_argument("--tau_high", type=float, default=0.95)
+    p.add_argument("--tau_percentile", type=float, default=0.15,
+                   help="Reject top tau_percentile fraction most similar to prototype")
+    p.add_argument("--tau_min", type=float, default=0.5,
+                   help="Minimum cosine similarity threshold (floor for adaptive gate)")
     p.add_argument("--upload_budget", type=int, default=500)
     p.add_argument("--n_views", type=int, default=2)
     p.add_argument("--low_data_k", type=int, default=10)
     p.add_argument("--high_risk_r", type=float, default=0.30)
+    p.add_argument("--replay_decay", type=float, default=0.995,
+                   help="Exponential decay factor for replay buffer sample weights")
+    p.add_argument("--replay_min_weight", type=float, default=0.3,
+                   help="Minimum weight for oldest replay buffer samples")
+    p.add_argument("--server_lr_decay", type=float, default=0.98,
+                   help="Per-round multiplicative LR decay for server head training")
+    p.add_argument("--server_lr_min", type=float, default=1e-4,
+                   help="Minimum LR floor for server head training")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--results_dir", default="results")
     p.add_argument("--device", default="auto")
-    p.add_argument("--methods", nargs="+", default=["fedavg", "proposed"])
+    p.add_argument("--centralized_epochs", type=int, default=50,
+                   help="Total training epochs for centralized baseline")
+    p.add_argument("--methods", nargs="+",
+                   default=["fedavg", "ao-frl", "centralized"])
     return p.parse_args()
 
 
@@ -183,9 +199,14 @@ class ProposedClient:
                                          minlength=n_classes)
 
     def extract_gated_embeddings(self, n_views=2):
-        """Extract privacy-gated embeddings from cached clean embeddings."""
+        """Extract privacy-gated embeddings from cached clean embeddings.
+        Uses adaptive percentile-based privacy gate: for each class, reject
+        the top tau_percentile fraction of samples most similar to the prototype.
+        """
         N = self.embs.size(0)
         labels_np = self.labels.numpy()
+        tau_percentile = self.cfg.get("tau_percentile", 0.15)
+        tau_min = self.cfg.get("tau_min", 0.5)
 
         # Compute per-class prototypes
         prototypes = torch.zeros(self.n_classes, self.embed_dim)
@@ -198,12 +219,9 @@ class ProposedClient:
                 prototypes[c] = F.normalize(embs_normed[mask].mean(0), dim=0)
                 proto_valid[c] = True
 
-        all_z, all_y = [], []
-        reject_count = 0
-        total_count = 0
-
+        # Phase 1: Generate all noised embeddings and compute similarities
+        all_candidates = []  # list of (z_tilde, label, similarity)
         for v in range(n_views):
-            # View-specific perturbation (simulates augmentation diversity)
             view_noise = torch.randn(N, self.embed_dim) * 0.01 * (v + 1)
             z_views = embs_normed + view_noise
 
@@ -217,29 +235,58 @@ class ProposedClient:
             # Gaussian noise
             z_tilde = z_views + torch.randn_like(z_views) * self.sigma
 
-            # Privacy gate (vectorized where possible)
+            # Compute per-sample similarity to class prototype
             for i in range(N):
-                total_count += 1
                 label = int(labels_np[i])
                 zt = z_tilde[i]
-
                 if proto_valid[label]:
                     sim = F.cosine_similarity(
                         zt.unsqueeze(0), prototypes[label].unsqueeze(0)
                     ).item()
-                    if sim > self.tau_high:
-                        reject_count += 1
-                        continue
+                else:
+                    sim = 0.0  # no prototype → always accept
+                all_candidates.append((zt, label, sim))
 
-                all_z.append(zt)
-                all_y.append(label)
+        # Phase 2: Adaptive percentile gate per class
+        # Group similarities by class to find per-class threshold
+        from collections import defaultdict
+        class_sims = defaultdict(list)
+        for idx, (_, label, sim) in enumerate(all_candidates):
+            class_sims[label].append((idx, sim))
 
-                if len(all_z) >= self.upload_budget:
-                    break
-            if len(all_z) >= self.upload_budget:
-                break
+        # Determine per-class thresholds
+        accepted_indices = set()
+        reject_count = 0
+        total_count = len(all_candidates)
+
+        for c, sim_list in class_sims.items():
+            if not proto_valid[c]:
+                # No prototype → accept all
+                for idx, _ in sim_list:
+                    accepted_indices.add(idx)
+                continue
+
+            sims = np.array([s for _, s in sim_list])
+            # Threshold = (1 - tau_percentile) quantile, but no lower than tau_min
+            threshold = max(np.percentile(sims, (1 - tau_percentile) * 100),
+                            tau_min)
+
+            for idx, sim in sim_list:
+                if sim > threshold:
+                    reject_count += 1
+                else:
+                    accepted_indices.add(idx)
 
         reject_ratio = reject_count / max(total_count, 1)
+
+        # Collect accepted embeddings up to upload budget
+        all_z, all_y = [], []
+        for idx in sorted(accepted_indices):
+            zt, label, _ = all_candidates[idx]
+            all_z.append(zt)
+            all_y.append(label)
+            if len(all_z) >= self.upload_budget:
+                break
 
         # Apply hooks
         self._apply_hooks(reject_ratio)
@@ -399,11 +446,22 @@ class FastEvaluator:
         if not self.metrics:
             return
 
+        method_styles = {
+            "Centralized": {"color": "tab:green", "linestyle": "--"},
+            "FedAvg": {"color": "tab:blue", "linestyle": "-"},
+            "AO-FRL": {"color": "tab:red", "linestyle": "-"},
+        }
+
+        def _style(method):
+            return method_styles.get(method, {"color": None, "linestyle": "-"})
+
+        # --- Plot 1: Accuracy vs Rounds ---
         fig, ax = plt.subplots(1, 1, figsize=(10, 6))
         for method, records in self.metrics.items():
             rounds = [r["round"] for r in records]
             accs = [r["accuracy"] * 100 for r in records]
-            ax.plot(rounds, accs, label=method, linewidth=2)
+            s = _style(method)
+            ax.plot(rounds, accs, label=method, linewidth=2, **s)
         ax.set_xlabel("Communication Round", fontsize=13)
         ax.set_ylabel("Global Test Accuracy (%)", fontsize=13)
         ax.set_title("Accuracy vs. Communication Rounds", fontsize=14)
@@ -414,11 +472,47 @@ class FastEvaluator:
                     dpi=150)
         plt.close(fig)
 
+        # --- Plot 2: Macro-F1 vs Rounds ---
+        fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+        for method, records in self.metrics.items():
+            rounds = [r["round"] for r in records]
+            f1s = [r["macro_f1"] * 100 for r in records]
+            s = _style(method)
+            ax.plot(rounds, f1s, label=method, linewidth=2, **s)
+        ax.set_xlabel("Communication Round", fontsize=13)
+        ax.set_ylabel("Macro-F1 (%)", fontsize=13)
+        ax.set_title("Macro-F1 vs. Communication Rounds", fontsize=14)
+        ax.legend(fontsize=12)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(self.results_dir, "f1_vs_rounds.png"),
+                    dpi=150)
+        plt.close(fig)
+
+        # --- Plot 3: Cumulative Communication Cost vs Rounds ---
+        fig, ax = plt.subplots(1, 1, figsize=(10, 6))
+        for method, records in self.metrics.items():
+            rounds = [r["round"] for r in records]
+            comm_mb = [r["cumulative_comm_bytes"] / 1e6 for r in records]
+            s = _style(method)
+            ax.plot(rounds, comm_mb, label=method, linewidth=2, **s)
+        ax.set_xlabel("Communication Round", fontsize=13)
+        ax.set_ylabel("Cumulative Communication (MB)", fontsize=13)
+        ax.set_title("Communication Cost vs. Rounds", fontsize=14)
+        ax.legend(fontsize=12)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(self.results_dir, "comm_vs_rounds.png"),
+                    dpi=150)
+        plt.close(fig)
+
+        # --- Plot 4: Communication Cost vs Accuracy ---
         fig, ax = plt.subplots(1, 1, figsize=(10, 6))
         for method, records in self.metrics.items():
             comm_mb = [r["cumulative_comm_bytes"] / 1e6 for r in records]
             accs = [r["accuracy"] * 100 for r in records]
-            ax.plot(comm_mb, accs, label=method, linewidth=2)
+            s = _style(method)
+            ax.plot(comm_mb, accs, label=method, linewidth=2, **s)
         ax.set_xlabel("Cumulative Communication (MB)", fontsize=13)
         ax.set_ylabel("Global Test Accuracy (%)", fontsize=13)
         ax.set_title("Communication Cost vs. Accuracy", fontsize=14)
@@ -431,9 +525,69 @@ class FastEvaluator:
 
 
 # ====================================================================== #
+#  Run Centralized (upper-bound baseline)                                 #
+# ====================================================================== #
+def run_centralized(args, train_embs, train_labs, evaluator, embed_dim,
+                    n_classes, device, logger, bus=None):
+    """Train a single MLPHead on ALL training data — no federation, no privacy.
+    This is the theoretical upper bound for the frozen-encoder setup.
+    We report results per-epoch so the curve is comparable to per-round plots.
+    """
+    logger.info("=" * 60)
+    logger.info("Starting Centralized baseline (upper bound)")
+    logger.info("=" * 60)
+
+    head = MLPHead(embed_dim, n_classes,
+                   hidden=args.head_hidden).to(device)
+    optimizer = torch.optim.Adam(head.parameters(), lr=args.server_lr)
+    loss_fn = nn.CrossEntropyLoss()
+
+    ds = TensorDataset(train_embs, train_labs)
+    loader = DataLoader(ds, batch_size=256, shuffle=True)
+
+    total_epochs = args.centralized_epochs
+    # Map epochs to "rounds" so the plot x-axis is comparable
+    # If rounds=100 and centralized_epochs=50, each epoch maps to 2 rounds
+    rounds_per_epoch = max(1, args.rounds / total_epochs)
+
+    for epoch in range(1, total_epochs + 1):
+        t0 = time.time()
+        head.train()
+        for z_batch, y_batch in loader:
+            z_batch = z_batch.to(device)
+            y_batch = y_batch.to(device)
+            loss = loss_fn(head(z_batch), y_batch)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        # Centralized has zero communication cost
+        mapped_round = int(epoch * rounds_per_epoch)
+
+        if bus:
+            t = bus.send_task("server", "evaluator", "evaluate",
+                              [Part(type="json", content={"method": "Centralized",
+                                                          "round": mapped_round})])
+        acc, f1 = evaluator.evaluate(head, "Centralized", mapped_round,
+                                      0, 0)
+        if bus:
+            bus.complete_task(t.task_id,
+                              response_parts=[Part(type="json",
+                                                   content={"acc": acc, "f1": f1})])
+
+        dt = time.time() - t0
+        if epoch % 10 == 0 or epoch == 1:
+            logger.info(f"[Centralized] Epoch {epoch:3d} (→R{mapped_round}) | "
+                        f"Acc:{acc:.4f} F1:{f1:.4f} ({dt:.1f}s)")
+
+    evaluator.save_csv("Centralized")
+    logger.info(f"[Centralized] Final acc={acc:.4f}")
+
+
+# ====================================================================== #
 #  Run FedAvg                                                             #
 # ====================================================================== #
-def run_fedavg(args, clients, server, evaluator, logger):
+def run_fedavg(args, clients, server, evaluator, logger, bus=None):
     logger.info("=" * 60)
     logger.info("Starting FedAvg baseline")
     logger.info("=" * 60)
@@ -445,9 +599,20 @@ def run_fedavg(args, clients, server, evaluator, logger):
         client_sds, client_sizes = [], []
 
         for c in clients:
+            # A2A: Server → Client local_train task
+            if bus:
+                t = bus.send_task("server", f"client_{c.id}", "local_train",
+                                  [Part(type="json", content={"round": rnd,
+                                                              "local_epochs": args.local_epochs})])
             sd, comm = c.local_train(server.get_fedavg_head(),
                                       args.local_epochs, args.fedavg_lr,
                                       args.batch_size)
+            if bus:
+                bus.complete_task(t.task_id,
+                                  artifacts=[Artifact(artifact_id=f"sd_r{rnd}_c{c.id}",
+                                                      name="state_dict",
+                                                      data=None,
+                                                      size_bytes=comm)])
             client_sds.append(sd)
             client_sizes.append(c.n_samples)
             round_comm += comm
@@ -457,8 +622,17 @@ def run_fedavg(args, clients, server, evaluator, logger):
         round_comm += head_params * 4 * args.n_clients
         cumulative_comm += round_comm
 
+        # A2A: Server → Evaluator evaluate task
+        if bus:
+            t = bus.send_task("server", "evaluator", "evaluate",
+                              [Part(type="json", content={"method": "FedAvg",
+                                                          "round": rnd})])
         acc, f1 = evaluator.evaluate(server.get_fedavg_head(), "FedAvg",
                                       rnd, round_comm, cumulative_comm)
+        if bus:
+            bus.complete_task(t.task_id,
+                              response_parts=[Part(type="json",
+                                                   content={"acc": acc, "f1": f1})])
 
         dt = time.time() - t0
         if rnd % 10 == 0 or rnd == 1:
@@ -472,20 +646,38 @@ def run_fedavg(args, clients, server, evaluator, logger):
 # ====================================================================== #
 #  Run Proposed                                                           #
 # ====================================================================== #
-def run_proposed(args, clients, server, evaluator, logger):
+def run_proposed(args, clients, server, evaluator, logger, bus=None):
     logger.info("=" * 60)
-    logger.info("Starting Proposed: Agent-Orchestrated Fed Rep Sharing")
+    logger.info("Starting AO-FRL: Agent-Orchestrated Fed Rep Sharing")
     logger.info("=" * 60)
 
     cumulative_comm = 0
+    instruction_history = []  # track server→client instructions per round
+
     for rnd in range(1, args.rounds + 1):
         t0 = time.time()
         round_comm = 0
         all_embs, all_labs, summaries = [], [], []
 
         for c in clients:
+            # A2A: Server → Client extract_embeddings task
+            if bus:
+                t = bus.send_task("server", f"client_{c.id}",
+                                  "extract_embeddings",
+                                  [Part(type="json",
+                                        content={"round": rnd,
+                                                 "n_views": args.n_views})])
             embs, labs, summary = c.extract_gated_embeddings(
                 n_views=args.n_views)
+            if bus:
+                bus.complete_task(t.task_id,
+                                  artifacts=[Artifact(
+                                      artifact_id=f"emb_r{rnd}_c{c.id}",
+                                      name="gated_embeddings",
+                                      data=None,
+                                      size_bytes=estimate_comm_bytes(embs))],
+                                  response_parts=[Part(type="json",
+                                                       content=summary)])
             all_embs.append(embs)
             all_labs.append(labs)
             summaries.append(summary)
@@ -506,27 +698,164 @@ def run_proposed(args, clients, server, evaluator, logger):
 
         instructions = server.orchestrate(summaries)
         for instr in instructions:
-            clients[instr["client_id"]].apply_server_instructions(instr)
+            cid = instr["client_id"]
+            # A2A: Server → Client apply_instructions task
+            if bus:
+                t = bus.send_task("server", f"client_{cid}",
+                                  "apply_instructions",
+                                  [Part(type="json", content=instr)])
+            clients[cid].apply_server_instructions(instr)
+            if bus:
+                bus.complete_task(t.task_id)
+
+        # Record per-round instruction stats
+        budgets = [instr["upload_budget"] for instr in instructions]
+        sigmas = [instr["sigma"] for instr in instructions]
+        n_conservative = sum(1 for instr in instructions
+                             if instr["augmentation_mode"] == "conservative")
+        total_up = sum(s["n_uploaded"] for s in summaries)
+        avg_rej = np.mean([s["reject_ratio"] for s in summaries])
+        instruction_history.append({
+            "round": rnd,
+            "avg_budget": np.mean(budgets),
+            "min_budget": int(np.min(budgets)),
+            "max_budget": int(np.max(budgets)),
+            "avg_sigma": np.mean(sigmas),
+            "max_sigma": float(np.max(sigmas)),
+            "n_conservative": n_conservative,
+            "n_normal": args.n_clients - n_conservative,
+            "total_uploaded": total_up,
+            "avg_reject_ratio": avg_rej,
+        })
 
         broadcast_bytes = server.train_head(merged_embs, merged_labs,
                                              epochs=args.server_train_epochs)
         round_comm += broadcast_bytes * args.n_clients
         cumulative_comm += round_comm
 
-        acc, f1 = evaluator.evaluate(server.get_head(), "Proposed",
+        # A2A: Server → Evaluator evaluate task
+        if bus:
+            t = bus.send_task("server", "evaluator", "evaluate",
+                              [Part(type="json", content={"method": "AO-FRL",
+                                                          "round": rnd})])
+        acc, f1 = evaluator.evaluate(server.get_head(), "AO-FRL",
                                       rnd, round_comm, cumulative_comm)
+        if bus:
+            bus.complete_task(t.task_id,
+                              response_parts=[Part(type="json",
+                                                   content={"acc": acc, "f1": f1})])
 
         dt = time.time() - t0
         if rnd % 10 == 0 or rnd == 1:
-            total_up = sum(s["n_uploaded"] for s in summaries)
-            avg_rej = np.mean([s["reject_ratio"] for s in summaries])
             logger.info(
-                f"[Proposed] R{rnd:3d} | Acc:{acc:.4f} F1:{f1:.4f} "
+                f"[AO-FRL] R{rnd:3d} | Acc:{acc:.4f} F1:{f1:.4f} "
                 f"Comm:{cumulative_comm/1e6:.1f}MB Up:{total_up} "
-                f"Rej:{avg_rej:.2f} ({dt:.1f}s)")
+                f"Rej:{avg_rej:.2f} | AvgBudget:{np.mean(budgets):.0f} "
+                f"AvgSigma:{np.mean(sigmas):.4f} "
+                f"Conservative:{n_conservative}/{args.n_clients} ({dt:.1f}s)")
 
-    evaluator.save_csv("Proposed")
-    logger.info(f"[Proposed] Final acc={acc:.4f}")
+    evaluator.save_csv("AO-FRL")
+    logger.info(f"[AO-FRL] Final acc={acc:.4f}")
+
+    # Save instruction history CSV
+    save_instruction_history(instruction_history, args.results_dir)
+    # Plot instruction trends
+    plot_instruction_trends(instruction_history, args.results_dir,
+                            args.n_clients)
+
+
+def save_instruction_history(history, results_dir):
+    """Save per-round server instruction stats to CSV."""
+    import csv
+    if not history:
+        return
+    path = os.path.join(results_dir, "server_instructions.csv")
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=history[0].keys())
+        w.writeheader()
+        w.writerows(history)
+
+
+def plot_instruction_trends(history, results_dir, n_clients):
+    """Plot how server instructions to clients change over rounds."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if not history:
+        return
+
+    rounds = [h["round"] for h in history]
+    avg_budgets = [h["avg_budget"] for h in history]
+    min_budgets = [h["min_budget"] for h in history]
+    max_budgets = [h["max_budget"] for h in history]
+    avg_sigmas = [h["avg_sigma"] for h in history]
+    max_sigmas = [h["max_sigma"] for h in history]
+    n_conservative = [h["n_conservative"] for h in history]
+    total_uploaded = [h["total_uploaded"] for h in history]
+    avg_reject = [h["avg_reject_ratio"] for h in history]
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # (0,0) Upload budget over rounds
+    ax = axes[0, 0]
+    ax.plot(rounds, avg_budgets, label="Avg budget", linewidth=2, color="tab:blue")
+    ax.fill_between(rounds, min_budgets, max_budgets, alpha=0.2, color="tab:blue",
+                    label="Min–Max range")
+    ax.set_xlabel("Communication Round")
+    ax.set_ylabel("Upload Budget (embeddings)")
+    ax.set_title("Server-assigned Upload Budget per Client")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # (0,1) Sigma (noise scale) over rounds
+    ax = axes[0, 1]
+    ax.plot(rounds, avg_sigmas, label="Avg sigma", linewidth=2, color="tab:orange")
+    ax.plot(rounds, max_sigmas, label="Max sigma", linewidth=1.5,
+            linestyle="--", color="tab:red")
+    ax.set_xlabel("Communication Round")
+    ax.set_ylabel("Noise Scale (sigma)")
+    ax.set_title("Server-assigned DP Noise Scale")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # (1,0) Augmentation mode distribution
+    ax = axes[1, 0]
+    n_normal = [n_clients - nc for nc in n_conservative]
+    ax.stackplot(rounds, n_conservative, n_normal,
+                 labels=["Conservative", "Normal"],
+                 colors=["tab:red", "tab:green"], alpha=0.7)
+    ax.set_xlabel("Communication Round")
+    ax.set_ylabel("Number of Clients")
+    ax.set_title("Augmentation Mode Distribution")
+    ax.legend(loc="center right")
+    ax.set_ylim(0, n_clients)
+    ax.grid(True, alpha=0.3)
+
+    # (1,1) Actual uploads & rejection ratio
+    ax = axes[1, 1]
+    ax.plot(rounds, total_uploaded, label="Total uploaded", linewidth=2,
+            color="tab:blue")
+    ax.set_xlabel("Communication Round")
+    ax.set_ylabel("Total Uploaded Embeddings", color="tab:blue")
+    ax.tick_params(axis='y', labelcolor="tab:blue")
+    ax.grid(True, alpha=0.3)
+    ax2 = ax.twinx()
+    ax2.plot(rounds, avg_reject, label="Avg reject ratio", linewidth=2,
+             color="tab:red", linestyle="--")
+    ax2.set_ylabel("Avg Rejection Ratio", color="tab:red")
+    ax2.tick_params(axis='y', labelcolor="tab:red")
+    ax2.set_ylim(-0.05, 1.05)
+    ax.set_title("Client Upload Volume & Privacy Gate Rejection")
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, loc="center right")
+
+    fig.suptitle("Server Orchestration — Per-Round Instruction Trends",
+                 fontsize=15, fontweight="bold")
+    fig.tight_layout()
+    fig.savefig(os.path.join(results_dir, "server_instructions.png"), dpi=150)
+    plt.close(fig)
 
 
 # ====================================================================== #
@@ -595,6 +924,27 @@ def main():
 
     cfg = {k: v for k, v in vars(args).items()}
 
+    # Initialize A2A bus
+    bus = A2ABus()
+    bus.register_agent(AgentCard("server", "ServerAgent",
+                                 "Orchestration & head training",
+                                 ["orchestrate", "train_head", "fedavg_aggregate"]))
+    bus.register_agent(AgentCard("evaluator", "EvaluatorAgent",
+                                 "Global model evaluation",
+                                 ["evaluate"]))
+    for i in range(args.n_clients):
+        bus.register_agent(AgentCard(f"client_{i}", f"ClientAgent_{i}",
+                                     f"Client {i} — local training & embedding extraction",
+                                     ["local_train", "extract_embeddings",
+                                      "apply_instructions"]))
+    logger.info(f"A2A bus initialized: {len(bus._agents)} agents registered")
+
+    # Run Centralized (upper bound)
+    if "centralized" in args.methods:
+        set_seed(args.seed)
+        run_centralized(args, train_embs, train_labs, evaluator,
+                        embed_dim, n_classes, device, logger, bus=bus)
+
     # Run FedAvg
     if "fedavg" in args.methods:
         set_seed(args.seed)
@@ -608,10 +958,10 @@ def main():
                               train_embs[va_idx], train_labs[va_idx],
                               n_classes, device)
             clients_fa.append(c)
-        run_fedavg(args, clients_fa, server_fa, evaluator, logger)
+        run_fedavg(args, clients_fa, server_fa, evaluator, logger, bus=bus)
 
-    # Run Proposed
-    if "proposed" in args.methods:
+    # Run AO-FRL
+    if "ao-frl" in args.methods:
         set_seed(args.seed)
         server_pr = ServerAgent(embed_dim, n_classes, args.n_clients,
                                  device, cfg)
@@ -624,11 +974,15 @@ def main():
                 train_embs[va_idx], train_labs[va_idx],
                 n_classes, embed_dim, device, cfg)
             clients_pr.append(c)
-        run_proposed(args, clients_pr, server_pr, evaluator, logger)
+        run_proposed(args, clients_pr, server_pr, evaluator, logger, bus=bus)
 
     # Final outputs
     evaluator.save_final_json()
     evaluator.plot_comparisons()
+
+    # Save A2A audit log
+    bus.save_log(os.path.join(args.results_dir, "a2a_communication.json"))
+    logger.info(f"A2A audit log saved: {bus.summary()['total_tasks']} tasks recorded")
 
     summary_path = os.path.join(args.results_dir, "final_summary.json")
     with open(summary_path) as f:

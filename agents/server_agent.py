@@ -62,7 +62,9 @@ class ServerAgent:
         # Replay buffer: accumulate embeddings across rounds so noise averages out
         self._replay_embs = []
         self._replay_labs = []
+        self._replay_ages = []  # round number when each chunk was added
         self._replay_max = cfg.get("replay_max", 50000)
+        self._current_round = 0
 
     # ------------------------------------------------------------------ #
     #  Proposed method: train head on collected embeddings                 #
@@ -72,8 +74,11 @@ class ServerAgent:
         """Train head on server-side collected embeddings.
         Accumulates embeddings in a replay buffer across rounds so that
         independent noise from different rounds averages out.
+        Uses weighted sampling with exponential age decay and per-round LR decay.
         Returns communication cost (bytes) for broadcasting head.
         """
+        self._current_round += 1
+
         if len(all_embeddings) == 0:
             n_params = sum(p.numel() for p in self.head.parameters())
             return n_params * 4
@@ -81,30 +86,52 @@ class ServerAgent:
         # Append current round's data to replay buffer
         self._replay_embs.append(all_embeddings.detach().cpu())
         self._replay_labs.append(all_labels.detach().cpu())
+        self._replay_ages.append(self._current_round)
 
         # Concatenate full buffer
         buf_embs = torch.cat(self._replay_embs)
         buf_labs = torch.cat(self._replay_labs)
 
+        # Build per-sample round labels for age weighting
+        buf_rounds = []
+        for emb_chunk, rnd in zip(self._replay_embs, self._replay_ages):
+            buf_rounds.append(torch.full((emb_chunk.size(0),), rnd,
+                                          dtype=torch.float32))
+        buf_rounds = torch.cat(buf_rounds)
+
         # Cap buffer size: keep most recent data
         if buf_embs.size(0) > self._replay_max:
             buf_embs = buf_embs[-self._replay_max:]
             buf_labs = buf_labs[-self._replay_max:]
-            # Rebuild list so memory doesn't grow unbounded
+            buf_rounds = buf_rounds[-self._replay_max:]
             self._replay_embs = [buf_embs]
             self._replay_labs = [buf_labs]
+            self._replay_ages = [self._current_round]  # approximate
 
-        # Reset optimizer each round to avoid stale momentum on noisy data,
-        # but keep head weights for continuity across rounds.
-        lr = self.cfg.get("server_lr", 1e-3)
+        # Compute sample weights: decay^age, floored at replay_min_weight
+        decay = self.cfg.get("replay_decay", 0.995)
+        min_weight = self.cfg.get("replay_min_weight", 0.3)
+        ages = self._current_round - buf_rounds  # age in rounds
+        weights = torch.clamp(decay ** ages, min=min_weight)
+
+        # LR decay: lr * server_lr_decay^round, floored at server_lr_min
+        base_lr = self.cfg.get("server_lr", 1e-3)
+        lr_decay = self.cfg.get("server_lr_decay", 0.98)
+        lr_min = self.cfg.get("server_lr_min", 1e-4)
+        lr = max(base_lr * (lr_decay ** (self._current_round - 1)), lr_min)
+
         opt_name = self.cfg.get("server_optimizer", "adam")
         if opt_name == "sgd":
-            optimizer = torch.optim.SGD(self.head.parameters(), lr=lr, momentum=0.9)
+            optimizer = torch.optim.SGD(self.head.parameters(), lr=lr,
+                                         momentum=0.9)
         else:
             optimizer = torch.optim.Adam(self.head.parameters(), lr=lr)
 
+        from torch.utils.data import WeightedRandomSampler
         ds = TensorDataset(buf_embs, buf_labs)
-        loader = DataLoader(ds, batch_size=256, shuffle=True)
+        sampler = WeightedRandomSampler(weights, num_samples=len(ds),
+                                         replacement=True)
+        loader = DataLoader(ds, batch_size=256, sampler=sampler)
 
         self.head.train()
         for _ in range(epochs):

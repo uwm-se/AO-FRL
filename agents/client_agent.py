@@ -105,20 +105,22 @@ class ClientAgent:
         # Since encoder is frozen, augmentation in embedding space is simulated
         # by adding small random perturbations (view noise) on top of DP noise.
         # This avoids re-running the encoder on augmented images every round.
-        all_z, all_y = [], []
-        reject_count = 0
-        total_count = 0
         N = clean_embs.size(0)
+        tau_percentile = self.cfg.get("tau_percentile", 0.15)
+        tau_min = self.cfg.get("tau_min", 0.5)
 
-        # Stack prototypes for vectorized gate check
+        # Stack prototypes for gate check
         proto_tensor = torch.zeros(self.n_classes, self.embed_dim)
         proto_mask = torch.zeros(self.n_classes, dtype=torch.bool)
         for c, p in prototypes.items():
             proto_tensor[c] = p
             proto_mask[c] = True
 
+        # Phase 1: Generate all noised embeddings and compute similarities
+        all_candidates = []  # list of (z_tilde, label, similarity)
+        labels_np = clean_labels.numpy()
+
         for view_idx in range(n_views):
-            # Simulate multi-view by adding small view-specific perturbation
             view_noise = torch.randn(N, self.embed_dim) * 0.01 * (view_idx + 1)
             z_views = clean_embs + view_noise
 
@@ -131,31 +133,54 @@ class ClientAgent:
             # Gaussian noise (vectorized)
             z_tilde_all = z_views + torch.randn(N, self.embed_dim) * self.sigma
 
-            # Privacy gate (vectorized)
-            labels_np = clean_labels.numpy()
             for i in range(N):
-                total_count += 1
-                label = labels_np[i]
+                label = int(labels_np[i])
                 z_tilde = z_tilde_all[i]
-
                 if proto_mask[label]:
                     sim = F.cosine_similarity(
                         z_tilde.unsqueeze(0),
                         proto_tensor[label].unsqueeze(0)
                     ).item()
-                    if sim > self.tau_high:
-                        reject_count += 1
-                        continue
+                else:
+                    sim = 0.0
+                all_candidates.append((z_tilde, label, sim))
 
-                all_z.append(z_tilde)
-                all_y.append(int(label))
+        # Phase 2: Adaptive percentile gate per class
+        from collections import defaultdict
+        class_sims = defaultdict(list)
+        for idx, (_, label, sim) in enumerate(all_candidates):
+            class_sims[label].append((idx, sim))
 
-                if len(all_z) >= self.upload_budget:
-                    break
-            if len(all_z) >= self.upload_budget:
-                break
+        accepted_indices = set()
+        reject_count = 0
+        total_count = len(all_candidates)
+
+        for c, sim_list in class_sims.items():
+            if not proto_mask[c]:
+                for idx, _ in sim_list:
+                    accepted_indices.add(idx)
+                continue
+
+            sims = np.array([s for _, s in sim_list])
+            threshold = max(np.percentile(sims, (1 - tau_percentile) * 100),
+                            tau_min)
+
+            for idx, sim in sim_list:
+                if sim > threshold:
+                    reject_count += 1
+                else:
+                    accepted_indices.add(idx)
 
         reject_ratio = reject_count / max(total_count, 1)
+
+        # Collect accepted embeddings up to upload budget
+        all_z, all_y = [], []
+        for idx in sorted(accepted_indices):
+            z_tilde, label, _ = all_candidates[idx]
+            all_z.append(z_tilde)
+            all_y.append(label)
+            if len(all_z) >= self.upload_budget:
+                break
 
         # Apply hooks
         self._apply_hooks(reject_ratio, all_z, all_y, prototypes)
