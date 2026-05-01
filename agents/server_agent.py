@@ -1,21 +1,26 @@
 """ServerAgent: aggregation, head training, orchestration, and FedAvg."""
 
-import copy
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
-from utils import estimate_comm_bytes
+from utils import allocate_budgets, update_per_class_target
 
 
 class MLPHead(nn.Module):
-    """Lightweight MLP classification head."""
+    """Lightweight MLP classification head.
+
+    LayerNorm (not BatchNorm) — the head is trained on DP-noised embeddings
+    (||z||≈√(1+σ²d)) but evaluated on clean unit-norm test embeddings.
+    BatchNorm would capture the noisy training distribution in its running
+    stats and corrupt clean inference; LayerNorm normalizes per-sample so
+    train/test distributions are decoupled.
+    """
     def __init__(self, in_dim: int, n_classes: int, hidden: int = 256):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
-            nn.BatchNorm1d(hidden),
+            nn.LayerNorm(hidden),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(hidden, n_classes),
@@ -59,11 +64,14 @@ class ServerAgent:
         # Orchestration state
         self.client_summaries = {}
 
-        # Replay buffer: accumulate embeddings across rounds so noise averages out
-        self._replay_embs = []
-        self._replay_labs = []
-        self._replay_ages = []  # round number when each chunk was added
-        self._replay_max = cfg.get("replay_max", 50000)
+        # Replay buffer: flat per-sample storage so age tracking survives
+        # truncation. Without this, the previous chunk-based design reset all
+        # surviving sample ages to the current round on each truncation,
+        # destroying cross-round noise averaging.
+        self._replay_embs = torch.zeros(0, embed_dim)              # (N, D)
+        self._replay_labs = torch.zeros(0, dtype=torch.long)        # (N,)
+        self._replay_rounds = torch.zeros(0, dtype=torch.float32)   # (N,)
+        self._replay_max = int(cfg.get("replay_max", 500_000))
         self._current_round = 0
 
     # ------------------------------------------------------------------ #
@@ -72,46 +80,42 @@ class ServerAgent:
     def train_head(self, all_embeddings: torch.Tensor,
                    all_labels: torch.Tensor, epochs: int = 3):
         """Train head on server-side collected embeddings.
-        Accumulates embeddings in a replay buffer across rounds so that
-        independent noise from different rounds averages out.
-        Uses weighted sampling with exponential age decay and per-round LR decay.
-        Returns communication cost (bytes) for broadcasting head.
+
+        Accumulates noisy embeddings in a flat replay buffer across rounds so
+        independent DP noise from different rounds can be averaged out via
+        WeightedRandomSampler with exponential age decay.
+
+        Returns: bytes for broadcasting head params (one download).
         """
         self._current_round += 1
+        n_params = sum(p.numel() for p in self.head.parameters())
+        head_bytes = n_params * 4
 
-        if len(all_embeddings) == 0:
-            n_params = sum(p.numel() for p in self.head.parameters())
-            return n_params * 4
+        # Append current round's samples
+        if all_embeddings.numel() > 0:
+            embs_cpu = all_embeddings.detach().cpu()
+            labs_cpu = all_labels.detach().cpu()
+            rnds = torch.full((embs_cpu.size(0),),
+                              float(self._current_round),
+                              dtype=torch.float32)
+            self._replay_embs = torch.cat([self._replay_embs, embs_cpu])
+            self._replay_labs = torch.cat([self._replay_labs, labs_cpu])
+            self._replay_rounds = torch.cat([self._replay_rounds, rnds])
 
-        # Append current round's data to replay buffer
-        self._replay_embs.append(all_embeddings.detach().cpu())
-        self._replay_labs.append(all_labels.detach().cpu())
-        self._replay_ages.append(self._current_round)
+        # Cap buffer (keep most recent samples; per-sample ages preserved)
+        if self._replay_embs.size(0) > self._replay_max:
+            keep = -self._replay_max
+            self._replay_embs = self._replay_embs[keep:]
+            self._replay_labs = self._replay_labs[keep:]
+            self._replay_rounds = self._replay_rounds[keep:]
 
-        # Concatenate full buffer
-        buf_embs = torch.cat(self._replay_embs)
-        buf_labs = torch.cat(self._replay_labs)
+        if self._replay_embs.size(0) == 0:
+            return head_bytes
 
-        # Build per-sample round labels for age weighting
-        buf_rounds = []
-        for emb_chunk, rnd in zip(self._replay_embs, self._replay_ages):
-            buf_rounds.append(torch.full((emb_chunk.size(0),), rnd,
-                                          dtype=torch.float32))
-        buf_rounds = torch.cat(buf_rounds)
-
-        # Cap buffer size: keep most recent data
-        if buf_embs.size(0) > self._replay_max:
-            buf_embs = buf_embs[-self._replay_max:]
-            buf_labs = buf_labs[-self._replay_max:]
-            buf_rounds = buf_rounds[-self._replay_max:]
-            self._replay_embs = [buf_embs]
-            self._replay_labs = [buf_labs]
-            self._replay_ages = [self._current_round]  # approximate
-
-        # Compute sample weights: decay^age, floored at replay_min_weight
+        # Per-sample weights: decay^age, floored at replay_min_weight
         decay = self.cfg.get("replay_decay", 0.995)
         min_weight = self.cfg.get("replay_min_weight", 0.3)
-        ages = self._current_round - buf_rounds  # age in rounds
+        ages = self._current_round - self._replay_rounds
         weights = torch.clamp(decay ** ages, min=min_weight)
 
         # LR decay: lr * server_lr_decay^round, floored at server_lr_min
@@ -128,8 +132,8 @@ class ServerAgent:
             optimizer = torch.optim.Adam(self.head.parameters(), lr=lr)
 
         from torch.utils.data import WeightedRandomSampler
-        ds = TensorDataset(buf_embs, buf_labs)
-        sampler = WeightedRandomSampler(weights, num_samples=len(ds),
+        ds = TensorDataset(self._replay_embs, self._replay_labs)
+        sampler = WeightedRandomSampler(weights.tolist(), num_samples=len(ds),
                                          replacement=True)
         loader = DataLoader(ds, batch_size=256, sampler=sampler)
 
@@ -144,12 +148,46 @@ class ServerAgent:
                 loss.backward()
                 optimizer.step()
 
-        # Comm cost: broadcast head params to all clients
-        n_params = sum(p.numel() for p in self.head.parameters())
-        return n_params * 4  # bytes for one download
+        return head_bytes
 
     # ------------------------------------------------------------------ #
-    #  Orchestration: generate per-client instructions                    #
+    #  AO-FRL orchestration: histogram-driven budget allocation           #
+    # ------------------------------------------------------------------ #
+    def init_budgets(self, label_histograms: np.ndarray, T_base: int):
+        """Round-1 budget allocation from client label histograms.
+
+        label_histograms: int (n_clients, n_classes), sample count per (i, c).
+        T_base: per-class total upload target across all clients.
+        Returns: budget matrix (n_clients, n_classes).
+        """
+        self._T_base = T_base
+        self._per_class_target = np.full(self.n_classes, T_base, dtype=np.int64)
+        self._label_hist = np.asarray(label_histograms, dtype=np.int64)
+        self._budget = allocate_budgets(self._label_hist, self._per_class_target)
+        return self._budget
+
+    def update_budgets_from_feedback(self, per_class_acc: np.ndarray,
+                                     alpha: float = 1.0):
+        """Re-balance budgets from aggregated per-class validation accuracy.
+
+        per_class_acc: float (n_classes,) — global avg val acc per class
+        (weighted across clients by sample count, computed by caller).
+        Returns: new budget matrix (n_clients, n_classes).
+        """
+        self._per_class_target = update_per_class_target(
+            per_class_acc, self._T_base, alpha=alpha)
+        self._budget = allocate_budgets(self._label_hist,
+                                        self._per_class_target)
+        return self._budget
+
+    def get_budgets(self):
+        return self._budget
+
+    def get_per_class_target(self):
+        return self._per_class_target
+
+    # ------------------------------------------------------------------ #
+    #  Legacy orchestration (used by 10-class test + ablations)           #
     # ------------------------------------------------------------------ #
     def orchestrate(self, summaries: list) -> list:
         """Analyze summaries and generate per-client instructions."""
@@ -223,6 +261,41 @@ class ServerAgent:
                 for sd, n in zip(client_state_dicts, client_sizes)
             )
         self.fedavg_head.load_state_dict(avg_state)
+
+    # ------------------------------------------------------------------ #
+    #  FedAdam (Reddi et al. 2020): server-side Adam over client deltas   #
+    # ------------------------------------------------------------------ #
+    def init_fedadam(self, lr: float = 1e-3, beta1: float = 0.9,
+                     beta2: float = 0.99, tau: float = 1e-3):
+        """Initialize server-side Adam moment estimates."""
+        self._fa_lr = lr
+        self._fa_b1 = beta1
+        self._fa_b2 = beta2
+        self._fa_tau = tau
+        self._fa_m = {n: torch.zeros_like(p)
+                      for n, p in self.fedavg_head.named_parameters()}
+        self._fa_v = {n: torch.zeros_like(p)
+                      for n, p in self.fedavg_head.named_parameters()}
+
+    def fedadam_aggregate(self, client_state_dicts: list,
+                          client_sizes: list):
+        """Aggregate via server-side Adam: average client deltas, apply Adam."""
+        total = sum(client_sizes)
+        if total == 0:
+            return
+        with torch.no_grad():
+            for name, server_p in self.fedavg_head.named_parameters():
+                avg_client = sum(
+                    sd[name].float().to(server_p.device) * (n / total)
+                    for sd, n in zip(client_state_dicts, client_sizes)
+                )
+                delta = avg_client - server_p          # pseudo-gradient
+                self._fa_m[name] = (self._fa_b1 * self._fa_m[name]
+                                    + (1 - self._fa_b1) * delta)
+                self._fa_v[name] = (self._fa_b2 * self._fa_v[name]
+                                    + (1 - self._fa_b2) * delta ** 2)
+                server_p.add_(self._fa_lr * self._fa_m[name]
+                              / (torch.sqrt(self._fa_v[name]) + self._fa_tau))
 
     def get_fedavg_head(self):
         return self.fedavg_head
