@@ -46,3 +46,13 @@ figures/
 
 # Jupyter Notebook
 .ipynb_checkpoints/
+
+# Model weights (large; reproducible from training scripts).
+# Keep only the decoder used for PSNR privacy evaluation.
+models/*.pt
+models/*.csv
+!models/decoder_frozen_enc.pt
+
+# Claude Code local state and per-machine settings (do not publish)
+.claude/
+.claude.json
