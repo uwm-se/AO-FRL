@@ -56,3 +56,6 @@ models/*.csv
 # Claude Code local state and per-machine settings (do not publish)
 .claude/
 .claude.json
+
+# Plotting scripts (figure-generation only; not part of the published API)
+plot_*.py
