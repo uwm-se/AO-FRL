@@ -31,7 +31,7 @@ python run_experiment.py \
   --inversion_n_samples 0 \
   --results_dir "${ROOT}/baselines"
 
-# ----- AO-FRL across 3 σ levels -----
+# ----- AO-FRL across 4 σ levels (0, 0.005, 0.02, 0.05) -----
 declare -a SIGMAS=("0" "0.005" "0.02" "0.05")
 declare -a TAGS=("clean" "weak" "medium" "strong")
 

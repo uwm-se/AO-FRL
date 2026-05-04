@@ -68,7 +68,7 @@ The trained weights are also tracked in this repo (`models/decoder_frozen_enc.pt
 ### 2. Run the 60-round federated baselines + AO-FRL
 
 ```bash
-# 7-method comparison: Centralized + FedAvg + FedProx + FedAdam + AO-FRL × 3σ
+# 8-method comparison: Centralized + FedAvg + FedProx + FedAdam + AO-FRL × 4σ (0, 0.005, 0.02, 0.05)
 bash run_full_comparison.sh
 
 # Or just one AO-FRL operating point
@@ -150,7 +150,7 @@ Trust the argparse block in `run_experiment.py` over this table for the exact se
 ├── probe_encoder_norms.py      # Embedding magnitude diagnostic
 ├── analyze_bottom_classes.py   # Bottom-10 / top-10 class + partition analysis
 ├── plot_*.py                   # Figures
-├── run_full_comparison.sh      # 7-method baseline orchestrator
+├── run_full_comparison.sh      # 8-method baseline orchestrator (4 baselines + 4 σ AO-FRL)
 ├── run_dp_sweep.sh             # σ sweep orchestrator
 └── CLAUDE.md                   # Project notes for Claude Code
 ```

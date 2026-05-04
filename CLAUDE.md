@@ -16,7 +16,7 @@ python run_experiment.py --rounds 100 --n_clients 20 --alpha 0.3 \
 # AO-FRL only at a specific σ
 python run_experiment.py --methods ao-frl --sigma 0.02 --rounds 60
 
-# Headline reproduction: 7-method comparison (4 baselines + 3 σ levels of AO-FRL)
+# Headline reproduction: 8-method comparison (4 baselines + 4 σ levels of AO-FRL: 0, 0.005, 0.02, 0.05)
 bash run_full_comparison.sh
 
 # σ sweep for AO-FRL only (strong / medium / weak)
@@ -73,7 +73,7 @@ python probe_encoder_norms.py
 `plot_*.py` scripts read CSVs from `results/` (or a custom dir) and write PNGs. The most-used:
 
 - [plot_all_figures.py](plot_all_figures.py) — paper figure bundle from `results/`
-- [plot_full_comparison.py](plot_full_comparison.py) — 7-method comparison from `results/full_compare/`
+- [plot_full_comparison.py](plot_full_comparison.py) — 8-method comparison from `results/full_compare/`
 - [plot_dp_comparison.py](plot_dp_comparison.py) — σ sweep
 - [plot_dataset_compare.py](plot_dataset_compare.py) — cifar100 / cifar10 / svhn transfer
 - [plot_encoder_compare60.py](plot_encoder_compare60.py), [plot_encoder_table.py](plot_encoder_table.py) — encoder fine-tuning ablation
